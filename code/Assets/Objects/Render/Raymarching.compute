@@ -1,0 +1,1365 @@
+///
+///Hello, if you, whoever you are want to understand this code, please start at following kernels:
+///VoxelAssistedRayMarching
+///Voxeliser
+///
+///All other kernels are either helper functions or are not used in the final product
+///
+///TODO : ADD MORE COMMENTS
+///
+
+//Config, Changes these if you want :)
+#define DebugMode false
+#define DisplayErrorCols true //only works in debug mode
+#define DisplayDataDigits true //only works in debug mode
+
+
+#define CloseValue 0.04f
+#define UseEdgeBoost true
+#define EdgeBoost 0 //NOT IMPLEMENTED
+
+
+
+
+
+//Definition Kernels, Do not Touch
+#pragma kernel RayMarch
+#pragma kernel Voxeliser
+#pragma kernel Spacing
+#pragma kernel ColorStep
+#pragma kernel VoxelAssistedRayMarching
+#define RM_TG_SIZE_X 8
+#define RM_TG_SIZE_Y 8
+#define RM_TG_SIZE_Z 1
+#define MaskArraySize 4
+
+#define ChildNotSet 0
+#define ParentNotSet -1
+#define MaxBreakDis 50
+#define MaxMarchSteps 50
+
+#define ConeMaxMarchSteps 50 //WIP
+
+
+
+//Constants, hands off
+#define MapSize 32
+#define THREAD_GROUPS_SIZE_X 8
+#define THREAD_GROUPS_SIZE_Y 4
+#define THREAD_GROUPS_SIZE_Z 1
+
+//There was something here
+[numthreads(RM_TG_SIZE_X, RM_TG_SIZE_Y, RM_TG_SIZE_Z)]
+void Spacing()
+{
+    return;
+}
+
+Texture2D<float4> Source;
+
+Texture2D<float4> Stars;
+RWTexture2D<float4> Destination;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float3 _Light;
+bool positionLight;
+
+int mipMapLevel;
+
+
+static const float maxDst = 80;
+static const float epsilon = 0.005f;
+static const float shadowBias = epsilon * 50;
+
+int numShapes;
+
+struct Shape
+{
+    float3 position;
+    float3 size;
+    float3 colour;
+    int shapeType;
+    int operation;
+    float blendStrength;
+    int ParentID;
+    float4 rotation;
+    float4 inverseRotation;
+};
+
+StructuredBuffer<Shape> shapes;
+
+
+uint mask0;
+uint mask1;
+uint mask2;
+uint mask3;
+
+void SetBit(uint index, bool value)
+{
+    const uint arrayIndex = index / 32; // Determine the index of the uint element in the array
+    const uint bitIndex = index % 32; // Determine the bit index within the uint element
+
+    uint mask;
+
+    switch (arrayIndex)
+    {
+    case 0:
+        mask = mask0;
+        break;
+    case 1:
+        mask = mask1;
+        break;
+    case 2:
+        mask = mask2;
+        break;
+    case 3:
+        mask = mask3;
+        break;
+    default: mask = mask0;
+        break;
+    }
+
+    if (value)
+        mask |= (1u << bitIndex); // Set the bit at the given index
+    else
+        mask &= ~(1u << bitIndex); // Clear the bit at the given index
+
+    switch (arrayIndex)
+    {
+    case 0:
+        mask0 = mask;
+        break;
+    case 1:
+        mask1 = mask;
+        break;
+    case 2:
+        mask2 = mask;
+        break;
+    case 3:
+        mask3 = mask;
+        break;
+    default: mask0 = mask;
+        break;
+    }
+}
+
+bool GetBit(uint index)
+{
+    const uint arrayIndex = index / 32; // Determine the index of the uint element in the array
+    const uint bitIndex = index % 32; // Determine the bit index within the uint element
+
+    uint mask;
+
+    switch (arrayIndex)
+    {
+    case 0:
+        mask = mask0;
+        break;
+    case 1:
+        mask = mask1;
+        break;
+    case 2:
+        mask = mask2;
+        break;
+    case 3:
+        mask = mask3;
+        break;
+    default: mask = mask0;
+        break;
+    }
+
+    return ((mask & (1u << bitIndex)) != 0); // Check the state of the bit at the given index
+}
+
+//(https://forum.unity.com/threads/float4x4-to-quaternion.121966/) take a look at this maybe
+//Following code found at https://forum.unity.com/threads/compute-shader-how-can-i-do-quaternion-vector3.763421/
+float4 qmul(float4 q1, float4 q2)
+{
+    return float4(
+        q2.xyz * q1.w + q1.xyz * q2.w + cross(q1.xyz, q2.xyz),
+        q1.w * q2.w - dot(q1.xyz, q2.xyz)
+    );
+}
+
+// Vector rotation with a quaternion
+// http://mathworld.wolfram.com/Quaternion.html
+float3 rotate_vector(float3 v, float4 r)
+{
+    float4 r_c = r * float4(-1, -1, -1, 1);
+    return qmul(r, qmul(float4(v, 0), r_c)).xyz;
+}
+
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+//Write a function, that returns the Field of View of the camera
+
+Ray CreateCameraRay(float2 uv)
+{
+    const float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+Ray CreateCameraRayPushed(float2 uv, float3 push)
+{
+    Ray ray = CreateCameraRay(uv);
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    ray.origin += direction * push;
+    return ray;
+}
+
+// polynomial smooth min (k = 0.1);
+// from https://www.iquilezles.org/www/articles/smin/smin.htm
+float4 Blend(float a, float b, float3 colA, float3 colB, float k)
+{
+    const float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+    float3 blendCol = lerp(colB, colA, h);
+    return float4(blendCol, blendDst);
+}
+
+float Blend(float a, float b, float k)
+//if abs(a-b) / k > 1 then you dont need to blend //TODO make bounding boxes and stuff, for less of this
+{
+    const float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1);
+    const float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+
+    return float(blendDst);
+}
+
+float4 Combine(float dstA, float dstB, float3 colourA, float3 colourB, int operation, float blendStrength)
+{
+    float dst = dstA;
+    float3 colour = colourA;
+
+    if (operation == 0)
+    {
+        if (dstB < dstA)
+        {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+    // Blend
+    else if (operation == 1)
+    {
+        float4 blend = Blend(dstA, dstB, colourA, colourB, blendStrength);
+        dst = blend.w;
+        colour = blend.xyz;
+    }
+    // Cut
+    else if (operation == 2)
+    {
+        // max(a,-b)
+        if (-dstB > dst)
+        {
+            dst = -dstB;
+            colour = colourB;
+        }
+    }
+    // Mask
+    else if (operation == 3)
+    {
+        // max(a,b)
+        if (dstB > dst)
+        {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+
+    return float4(colour, dst);
+}
+
+float Combine(float dstA, float dstB, int operation, float blendStrength)
+{
+    float dst = dstA;
+
+
+    if (operation == 0)
+    {
+        if (dstB < dstA)
+        {
+            dst = dstB;
+        }
+    }
+    // Blend
+    else if (operation == 1)
+    {
+        const float blend = Blend(dstA, dstB, blendStrength);
+        dst = blend;
+    }
+    // Cut
+    else if (operation == 2)
+    {
+        // max(a,-b)
+        if (-dstB > dst)
+        {
+            dst = -dstB;
+        }
+    }
+    // Mask
+    else if (operation == 3)
+    {
+        // max(a,b)
+        if (dstB > dst)
+        {
+            dst = dstB;
+        }
+    }
+
+    return float(dst);
+}
+
+float SphereDistance(float3 eye, float3 centre, float radius)
+{
+    return distance(eye, centre) - radius;
+}
+
+float CubeDistance(float3 eye, float3 centre, float3 size, float4 rotation)
+{
+    float3 centreDiff = eye - centre;
+    centreDiff = rotate_vector(centreDiff, rotation); //This is my stuff
+    float3 o = abs(centreDiff) - size;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0), min(o.y, 0)), min(o.z, 0)); //dont know what this does yet
+    return ud + n;
+}
+
+float AABDistance(float3 eye, float3 centre, float3 size)
+{
+    float3 o = abs(eye - centre) - size;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0), min(o.y, 0)), min(o.z, 0)); //dont know what this does yet
+    return ud + n;
+}
+
+
+#define S_SPHERE 0
+#define S_CUBE 1
+#define S_AAB 2
+
+float GetShapeDistance(Shape shape, float3 eye)
+{
+    if (shape.shapeType == S_SPHERE)
+    {
+        return SphereDistance(eye, shape.position, shape.size.x);
+    }
+    else if (shape.shapeType == S_CUBE)
+    {
+        return CubeDistance(eye, shape.position, shape.size, shape.inverseRotation);
+    }
+    else if (shape.shapeType == S_AAB)
+    {
+        return AABDistance(eye, shape.position, shape.size);
+    }
+    return -2;
+}
+
+float4 SceneInfoCol(float3 eye)
+{
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+
+    for (int i = 0; i < numShapes; i++)
+    {
+        Shape shape = shapes[i];
+
+
+        float localDst = GetShapeDistance(shape, eye);
+        float3 localColour = shape.colour;
+
+
+        float4 globalCombined = Combine(globalDst, localDst, globalColour, localColour, shape.operation,
+                                        shape.blendStrength);
+        globalColour = globalCombined.xyz;
+        globalDst = globalCombined.w;
+    }
+
+    return float4(globalColour, globalDst);
+}
+
+float4 LimSceneInfoCol(float3 eye, float breakDistance = MaxBreakDis, bool Write = true)
+{
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+
+    for (int i = 0; i < numShapes; i++)
+    {
+        if (!GetBit(i))
+        {
+            continue;
+        }
+        Shape shape = shapes[i];
+        float localDst = GetShapeDistance(shape, eye);
+        if (localDst < breakDistance/*TestDistanceMAX*/)
+        {
+            if (Write)
+                SetBit(i, true);
+
+            float3 localColour = shape.colour;
+
+
+            float4 globalCombined = Combine(globalDst, localDst, globalColour, localColour, shape.operation,
+                                            shape.blendStrength);
+
+            globalColour = globalCombined.xyz;
+            globalDst = globalCombined.w;
+        }
+    }
+
+    return float4(globalColour, globalDst);
+}
+
+float SceneInfo(float3 eye)
+{
+    float globalDst = maxDst;
+
+
+    for (int i = 0; i < numShapes; i++)
+    {
+        Shape shape = shapes[i];
+
+
+        float localDst = GetShapeDistance(shape, eye);
+
+
+        float globalCombined = Combine(globalDst, localDst, shape.operation, shape.blendStrength);
+
+        globalDst = globalCombined;
+    }
+
+    return float(globalDst);
+}
+
+#define TestDistanceMAX 1000
+
+
+float LimSceneInfo(float3 eye, float breakDistance = MaxBreakDis, bool Write = true)
+{
+    float globalDst = breakDistance;
+    globalDst = TestDistanceMAX;
+
+    int LoopCount = min((MaskArraySize) * 32, numShapes);
+
+    for (int i = 0; i < LoopCount; i++)
+    {
+        if (!GetBit(i))
+        {
+            continue;
+        }
+        Shape shape = shapes[i];
+
+        float localDst = GetShapeDistance(shape, eye);
+        if (localDst < breakDistance/*TestDistanceMAX*/)
+        {
+            if (Write)
+                SetBit(i, true);
+
+            float globalCombined = Combine(globalDst, localDst, shape.operation, shape.blendStrength);
+
+            globalDst = globalCombined;
+        }
+        else
+        {
+            if (Write)
+                SetBit(i, false);
+        }
+    }
+
+    return globalDst; //TODO THIS IS NOT SCALABLE, also its ugly, cause i dont know how to do out parameters
+}
+
+float3 LimEstimateNormal(float3 p)
+{
+    float x = LimSceneInfo(float3(p.x + epsilon, p.y, p.z),MaxBreakDis, false) - LimSceneInfo(
+        float3(p.x - epsilon, p.y, p.z),MaxBreakDis, false);
+    float y = LimSceneInfo(float3(p.x, p.y + epsilon, p.z), MaxBreakDis, false) - LimSceneInfo(
+        float3(p.x, p.y - epsilon, p.z),MaxBreakDis, false);
+    float z = LimSceneInfo(float3(p.x, p.y, p.z + epsilon), MaxBreakDis, false) - LimSceneInfo(
+        float3(p.x, p.y, p.z - epsilon),MaxBreakDis, false);
+    return normalize(float3(x, y, z));
+}
+
+float3 EstimateNormal(float3 p)
+{
+    float x = SceneInfo(float3(p.x + epsilon, p.y, p.z)) - SceneInfo(float3(p.x - epsilon, p.y, p.z));
+    float y = SceneInfo(float3(p.x, p.y + epsilon, p.z)) - SceneInfo(float3(p.x, p.y - epsilon, p.z));
+    float z = SceneInfo(float3(p.x, p.y, p.z + epsilon)) - SceneInfo(float3(p.x, p.y, p.z - epsilon));
+    return normalize(float3(x, y, z));
+}
+
+float CalculateShadow(Ray ray, float dstToShadePoint)
+{
+    float rayDst = 0;
+    int marchSteps = 0;
+    float shadowIntensity = .2;
+    float brightness = 1;
+
+    while (rayDst < dstToShadePoint)
+    {
+        marchSteps++;
+        float dst = SceneInfo(ray.origin);
+
+
+        if (dst <= epsilon)
+        {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness, dst * 200);
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+    return shadowIntensity + (1 - shadowIntensity) * brightness;
+}
+
+
+/**
+ * \brief
+ *
+ * Unoptimised raymarcher, used for debugging
+ * Not used in the actual game
+ * \param id 
+ */
+[numthreads(RM_TG_SIZE_X,RM_TG_SIZE_Y,RM_TG_SIZE_Z)]
+void RayMarch(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Destination.GetDimensions(width, height);
+
+    Destination[id.xy] = Source[id.xy];
+
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+    float rayDst = 0;
+
+    Ray ray = CreateCameraRay(uv);
+    int marchSteps = 0;
+
+    while (rayDst < maxDst)
+    {
+        marchSteps++;
+
+        //Instead of generating it this way every time, use mipmaps where applicable
+        float dst = SceneInfo(ray.origin);
+
+        if (dst <= epsilon)
+        {
+            // Do this once the ray "hits" something
+            float4 sceneInfo = SceneInfoCol(ray.origin);
+            float3 pointOnSurface = ray.origin + ray.direction * dst;
+            float3 normal = EstimateNormal(pointOnSurface - ray.direction * epsilon);
+            float3 lightDir = (positionLight) ? normalize(_Light - ray.origin) : -_Light;
+            float lighting = saturate(saturate(dot(normal, lightDir)));
+            float3 col = sceneInfo.xyz;
+
+            // Shadow
+            float3 offsetPos = pointOnSurface + normal * shadowBias;
+            float3 dirToLight = (positionLight) ? normalize(_Light - offsetPos) : -_Light;
+
+            ray.origin = offsetPos;
+            ray.direction = dirToLight;
+
+            float dstToLight = (positionLight) ? distance(offsetPos, _Light) : maxDst;
+            float shadow = CalculateShadow(ray, dstToLight);
+
+            Destination[id.xy] = float4(col * lighting * shadow, 1);
+
+            //Destination[id.xy] = float4(sceneInfo.xyz,1);
+            break;
+        } //Once we hit something, we can stop the ray-marching
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+}
+
+
+struct VoxelSDF //this could be improved by grouping low size variables together into ints and bit-shifting them
+{
+    int parent;
+    float SDF;
+    float3 pos;
+    int inVoxel;
+    uint mipMapLevel;
+    uint Mask[4];
+    uint child[8];
+    int HasBeenUpdated; //helps with debugging a lot
+};
+
+RWStructuredBuffer<VoxelSDF> VoxelSDFBuffer;
+RWStructuredBuffer<int> ReadPointer;
+RWStructuredBuffer<int> WritePointer;
+RWStructuredBuffer<int> ThreadsNeeded;
+RWStructuredBuffer<bool> NeedWriteSpace;
+//This stores how many Threads are currently needed and will update at each completion of a recursion, so that there is no need for all Threads to check for available work
+int ThreadGroupsX;
+int ThreadGroupsY;
+int BufferLength;
+
+//Size of the map in Unity Units0
+
+
+int idToLinear(uint3 id)
+{
+    return id.x + id.y * THREAD_GROUPS_SIZE_X * ThreadGroupsX + id.z * THREAD_GROUPS_SIZE_X * ThreadGroupsX *
+        THREAD_GROUPS_SIZE_Y * ThreadGroupsY;
+}
+
+[numthreads(THREAD_GROUPS_SIZE_X,THREAD_GROUPS_SIZE_Y,THREAD_GROUPS_SIZE_Z)]
+void Voxeliser(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
+{
+    int MaxThreads = ThreadGroupsX * ThreadGroupsY * THREAD_GROUPS_SIZE_X * THREAD_GROUPS_SIZE_Y * THREAD_GROUPS_SIZE_Z;
+    if (WritePointer[0] > BufferLength)
+        return;
+
+
+    if (idToLinear(id) >= ThreadsNeeded[0])
+
+        return;
+
+
+    int readPointer = ReadPointer[0] + idToLinear(id);
+
+    //GroupMemoryBarrierWithGroupSync();
+
+
+    InterlockedAdd(ReadPointer[0], 1);
+
+    if (readPointer >= BufferLength)
+        return;
+    InterlockedAdd(VoxelSDFBuffer[readPointer].HasBeenUpdated, 1);
+    //VoxelSDF parentData = VoxelSDFBuffer[readData.parent];
+    #define SQRT3 1.73205080757
+    float3 pos = VoxelSDFBuffer[readPointer].pos;
+    if (readPointer != 0)
+    {
+        mask0 = VoxelSDFBuffer[readPointer].Mask[0];
+        mask1 = VoxelSDFBuffer[readPointer].Mask[1];
+        mask2 = VoxelSDFBuffer[readPointer].Mask[2];
+        mask3 = VoxelSDFBuffer[readPointer].Mask[3];
+    }
+    else
+    {
+        mask0 = 0xFFFFFFFF;
+        mask1 = 0xFFFFFFFF;
+        mask2 = 0xFFFFFFFF;
+        mask3 = 0xFFFFFFFF;
+        for (int i = 0; i < 8; i++)
+        {
+            VoxelSDFBuffer[0].child[i] = 0;
+        }
+    }
+    float BreakOut = (float)MapSize / pow(2, (VoxelSDFBuffer[readPointer].mipMapLevel + 1)) * SQRT3;
+
+    VoxelSDFBuffer[readPointer].SDF = LimSceneInfo(pos, BreakOut + 1);
+
+    VoxelSDFBuffer[readPointer].Mask[0] = mask0;
+    VoxelSDFBuffer[readPointer].Mask[1] = mask1;
+    VoxelSDFBuffer[readPointer].Mask[2] = mask2;
+    VoxelSDFBuffer[readPointer].Mask[3] = mask3;
+
+    mipMapLevel = VoxelSDFBuffer[readPointer].mipMapLevel;
+    int writepointer = -1;
+    bool tmpbool = VoxelSDFBuffer[readPointer].SDF <= BreakOut + 1;
+
+
+    NeedWriteSpace[idToLinear(id)] = tmpbool;
+    int LastWritePos = WritePointer[0];
+    GroupMemoryBarrierWithGroupSync();
+    InterlockedAdd(WritePointer[0], tmpbool ? 8 : 0);
+
+    int j = 0;
+    for (int i = 0; i < min(ThreadsNeeded[0], MaxThreads); i++)
+    {
+        if (i >= idToLinear(id))
+            break;
+        if (NeedWriteSpace[i]) j++;
+    }
+    writepointer = LastWritePos + j * 8;
+
+
+    if (tmpbool)
+    {
+        VoxelSDFBuffer[readPointer].inVoxel = 1;
+
+        for (uint i = 0; i < 8; i++)
+        {
+            if (writepointer + int(i) >= BufferLength)
+            {
+                InterlockedAdd(ThreadsNeeded[0], -1 + i);
+                return;
+            }
+            VoxelSDFBuffer[readPointer].child[i] = writepointer + i;
+
+            VoxelSDFBuffer[writepointer + i].parent = readPointer;
+            VoxelSDFBuffer[writepointer + i].pos = pos + float3((i % 2) - 0.5f, ((i / 2) % 2) - 0.5f,
+                                                                ((i / 4) % 2) - 0.5f) * float(MapSize) / pow(
+                2, (mipMapLevel + 1));
+            VoxelSDFBuffer[writepointer + i].inVoxel = 0;
+            VoxelSDFBuffer[writepointer + i].mipMapLevel = mipMapLevel + 1;
+            VoxelSDFBuffer[writepointer + i].Mask[0] = mask0;
+            VoxelSDFBuffer[writepointer + i].Mask[1] = mask1;
+            VoxelSDFBuffer[writepointer + i].Mask[2] = mask2;
+            VoxelSDFBuffer[writepointer + i].Mask[3] = mask3;
+            VoxelSDFBuffer[writepointer + i].SDF = -2;
+            VoxelSDFBuffer[writepointer + i].child[0] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[1] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[2] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[3] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[4] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[5] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[6] = ChildNotSet;
+            VoxelSDFBuffer[writepointer + i].child[7] = ChildNotSet;
+        }
+        InterlockedAdd(ThreadsNeeded[0], 7);
+    }
+    else
+    {
+        VoxelSDFBuffer[readPointer].inVoxel = 0;
+
+        InterlockedAdd(ThreadsNeeded[0], -1);
+    }
+}
+
+
+bool isInVoxel(float3 pos, float3 voxelPos, float voxelSize)
+{
+    float3 min = voxelPos - voxelSize / 2;
+    float3 max = voxelPos + voxelSize / 2;
+    if (pos.x > min.x && pos.x < max.x && pos.y > min.y && pos.y < max.y && pos.z > min.z && pos.z < max.z)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool isLeaf(int id)
+{
+    if (VoxelSDFBuffer[id].child[7] == ChildNotSet)
+    {
+        return true;
+    }
+    return false;
+}
+
+int walkUp(int start, float3 pos)
+{
+    int id = start;
+    while (id != ParentNotSet)
+    {
+        if (isInVoxel(pos, VoxelSDFBuffer[id].pos, float(MapSize) / pow(2, VoxelSDFBuffer[id].mipMapLevel)))
+        {
+            return id;
+        }
+        id = VoxelSDFBuffer[id].parent;
+    }
+    return -1;
+}
+
+int walkDown(int start, float3 pos)
+{
+    int breakOut = 0; //TRI
+    int id = start;
+    while (id != -1)
+    {
+        if (breakOut++ > 15) return -1; //TRI
+        bool Error = true;
+        if (isLeaf(id))
+        {
+            return id;
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            if (isInVoxel(pos, VoxelSDFBuffer[VoxelSDFBuffer[id].child[i]].pos,
+                          float(MapSize) / pow(2, VoxelSDFBuffer[id].mipMapLevel + 1)))
+            {
+                id = VoxelSDFBuffer[id].child[i];
+                Error = false;
+                break;
+            }
+        }
+        if (Error)
+            return -1;
+    }
+    return -1;
+}
+
+struct Intersect
+{
+    float dis;
+    float3 pos;
+    bool is;
+};
+
+#define MaxValue 100000
+#define ExtraValue 0.0001
+
+Intersect getAABoxIntersectDistance(float3 pos, float3 dir, float3 minin, float3 maxin)
+{
+    float3 t1 = (minin - pos) / dir;
+    float3 t2 = (maxin - pos) / dir;
+
+    float minOver0 = MaxValue;
+
+    if (t1.x > 0 && t1.x < minOver0)
+        minOver0 = t1.x;
+
+    if (t1.y > 0 && t1.y < minOver0)
+        minOver0 = t1.y;
+
+    if (t1.z > 0 && t2.z < minOver0)
+        minOver0 = t1.z;
+    if (t2.x > 0 && t2.x < minOver0)
+        minOver0 = t2.x;
+    if (t2.y > 0 && t2.y < minOver0)
+        minOver0 = t2.y;
+    if (t2.z > 0 && t2.z < minOver0)
+        minOver0 = t2.z;
+
+    if (minOver0 == MaxValue)
+    {
+        Intersect outh;
+        outh.dis = MaxValue;
+        outh.pos = pos;
+        outh.is = false;
+        return outh;
+    }
+    Intersect outh1;
+    outh1.dis = minOver0 + ExtraValue;
+    outh1.pos = pos + dir * minOver0 + ExtraValue;
+    outh1.is = true;
+    return outh1;
+}
+
+float3 _CameraPos;
+
+
+/*MIT License
+
+Copyright (c) 2020 Dominik Zimny                                                        //But modified by me
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+// https://github.com/Ideefixze/Softbodies/tree/master
+
+float3 CalculateColor(float value, float greenBorder, float yellowBorder, float redBorder)
+{
+    float hue = value / 255.0 * 240.0; // Map the value to the hue range (0-240)
+    float saturation = 1.0; // Maximum saturation (fully saturated colors)
+    float lightness = 0.5; // Constant lightness (midpoint)
+
+    // Calculate the hue segment
+    float3 color;
+    if (hue <= greenBorder)
+    {
+        // Blue to green
+        float hue_segment = hue / greenBorder;
+        color = float3(0, hue_segment, 1);
+    }
+    else if (hue <= yellowBorder)
+    {
+        // Green to yellow
+        float hue_segment = (hue - greenBorder) / (yellowBorder - greenBorder);
+        color = float3(hue_segment, 1, 0);
+    }
+    else if (hue <= redBorder)
+    {
+        // Yellow to red
+        float hue_segment = (hue - yellowBorder) / (redBorder - yellowBorder);
+        color = float3(1, 1 - hue_segment, 0);
+    }
+    else
+    {
+        // Red
+        color = float3(1, 0, 0);
+    }
+
+    // Adjust saturation and lightness
+    saturation /= 1.0;
+    lightness /= 1.0;
+
+    return color * saturation + (1.0 - saturation) * lightness;
+}
+
+[numthreads(RM_TG_SIZE_X,RM_TG_SIZE_Y,RM_TG_SIZE_Z)]
+void ColorStep(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Destination.GetDimensions(width, height);
+
+    Destination[id.xy] = Source[id.xy];
+
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+    float rayDst = 0;
+
+    Ray ray = CreateCameraRay(uv);
+    int marchSteps = 0;
+
+    while (rayDst < maxDst)
+    {
+        marchSteps++;
+
+        float dst = SceneInfo(ray.origin);
+
+        if (dst <= epsilon)
+        {
+            // Do this once the ray "hits" something
+            float4 sceneInfo = SceneInfoCol(ray.origin);
+            float3 pointOnSurface = ray.origin + ray.direction * dst;
+            float3 normal = EstimateNormal(pointOnSurface - ray.direction * epsilon);
+            float3 lightDir = (positionLight) ? normalize(_Light - ray.origin) : -_Light;
+            float lighting = saturate(saturate(dot(normal, lightDir)));
+            float3 col = sceneInfo.xyz;
+
+            // Shadow
+            float3 offsetPos = pointOnSurface + normal * shadowBias;
+            float3 dirToLight = (positionLight) ? normalize(_Light - offsetPos) : -_Light;
+
+            ray.origin = offsetPos;
+            ray.direction = dirToLight;
+
+            float dstToLight = (positionLight) ? distance(offsetPos, _Light) : maxDst;
+            float shadow = CalculateShadow(ray, dstToLight);
+
+            Destination[id.xy] = float4(CalculateColor(marchSteps, 5, 10, 25), 1);
+
+            //Destination[id.xy] = float4(sceneInfo.xyz,1);
+            break;
+        } //Once we hit something, we can stop the ray-marching
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+}
+
+float4 DataDisplayer(uint3 id, int Display, float4 inCol)
+{
+    if (!DisplayDataDigits)
+        return inCol;
+    uint x = id.x % 16;
+    uint y = id.y % 16;
+
+    float4 Col1 = float4((uint(Display) / 20) % 2, (uint(Display) / 10) % 2, 0.8, 1);
+    float4 Col2 = float4(0, 0, 0, 1);
+
+    Col2 = inCol;
+    Col1 = 1 - inCol;
+
+    if (x > 7 || y > 7)
+        return Col2;
+    int aDisplay = Display % 10;
+    if (aDisplay < 0)
+    {
+        aDisplay *= -1;
+    }
+    bool map[8][8];
+    switch (aDisplay)
+    {
+    case 0: const bool map1[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0}
+        };
+        map = map1;
+        break;
+    case 1: const bool map2[8][8] =
+        {
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 1, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 1, 1, 1, 0, 0, 0, 0}
+        };
+        map = map2;
+        break;
+
+    case 2: const bool map3[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 1, 0, 0},
+            {0, 0, 0, 0, 1, 0, 0, 0},
+            {0, 0, 0, 1, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 1, 0, 0, 0, 0, 0, 0},
+            {1, 1, 1, 1, 1, 1, 1, 0}
+        };
+        map = map3;
+        break;
+    case 3: const bool map4[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 1, 1, 1, 1, 0},
+            {0, 0, 0, 1, 1, 1, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0}
+        };
+        map = map4;
+        break;
+    case 4: const bool map5[8][8] = {
+            {0, 0, 0, 0, 1, 1, 0, 0},
+            {0, 0, 0, 1, 1, 1, 0, 0},
+            {0, 0, 1, 0, 1, 1, 0, 0},
+            {0, 1, 0, 0, 1, 1, 0, 0},
+            {1, 1, 1, 1, 1, 1, 1, 1},
+            {0, 0, 0, 0, 1, 1, 0, 0},
+            {0, 0, 0, 0, 1, 1, 0, 0},
+            {0, 0, 0, 0, 1, 1, 0, 0}
+        };
+        map = map5;
+        break;
+    case 5: const bool map6[8][8] = {
+            {1, 1, 1, 1, 1, 1, 1, 0},
+            {1, 0, 0, 0, 0, 0, 0, 0},
+            {1, 0, 0, 0, 0, 0, 0, 0},
+            {0, 1, 1, 1, 1, 1, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0}
+        };
+        map = map6;
+        break;
+    case 6: const bool map7[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 0, 0},
+            {1, 0, 0, 0, 0, 0, 0, 0},
+            {1, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0}
+        };
+        map = map7;
+        break;
+    case 7: const bool map8[8][8] = {
+            {1, 1, 1, 1, 1, 1, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 1, 0, 0},
+            {0, 0, 0, 0, 1, 0, 0, 0},
+            {0, 0, 0, 1, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0}
+        };
+        map = map8;
+        break;
+    case 8: const bool map9[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0}
+        };
+        map = map9;
+        break;
+    case 9: const bool map10[8][8] = {
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {1, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 1, 1, 1, 1, 1, 0, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0}
+        };
+        map = map10;
+        break;
+
+    default: const bool map11[8][8] = {
+            {0, 0, 0, 0, 0, 0, 0, 0},
+            {0, 1, 0, 0, 0, 0, 0, 0},
+            {0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 0, 1, 0, 0, 0, 0},
+            {0, 0, 0, 0, 1, 0, 0, 0},
+            {0, 0, 0, 0, 0, 1, 0, 0},
+            {0, 0, 0, 0, 0, 0, 1, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0}
+        };
+        map = map11;
+        break;
+    };
+
+    if (Display > 0)
+    {
+        if (map[7 - y][x])
+        {
+            return Col1;
+        }
+        else
+        {
+            return Col2;
+        }
+    }
+    else if (map[7 - y][x])
+    {
+        return Col2;
+    }
+    else
+    {
+        return Col1;
+    }
+}
+
+
+float LimCalculateShadow(Ray ray, float dstToShadePoint, int voxelPos)
+{
+    float rayDst = 0;
+    int marchSteps = 0;
+    const float shadowIntensity = .2;
+    float brightness = 1;
+
+    while (rayDst < dstToShadePoint)
+    {
+        marchSteps++;
+        float dst = LimSceneInfo(ray.origin, 50000);
+        float dis = MapSize / pow(2, VoxelSDFBuffer[voxelPos].mipMapLevel + 1);
+        const float3 dis3 = float3(dis, dis, dis);
+        const Intersect maxWalkable = getAABoxIntersectDistance(ray.origin, ray.direction,
+                                                                VoxelSDFBuffer[voxelPos].pos - dis3,
+                                                                VoxelSDFBuffer[voxelPos].pos + dis3);
+        if (!maxWalkable.is)
+        {
+            return 0;
+        }
+
+        if (dst > maxWalkable.dis)
+        {
+            dst = maxWalkable.dis;
+            voxelPos = walkUp(voxelPos, ray.origin + ray.direction * dst);
+            if (voxelPos == -1)
+            {
+                return 0;
+            }
+            voxelPos = walkDown(voxelPos, ray.origin + ray.direction * dst);
+            if (voxelPos == -1)
+            {
+                return 0;
+            }
+        }
+
+        if (dst <= epsilon)
+        {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness, dst * 200);
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+    return shadowIntensity + (1 - shadowIntensity) * brightness;
+}
+
+
+#define TextureScale 5.0
+
+float2 Map2Stars(float2 idIn, float3 normal)
+{
+    uint width, height;
+    Stars.GetDimensions(width, height);
+    float2 IDOut = (idIn) * TextureScale;
+    return float2((IDOut.x + width * 10) % width, (IDOut.y + height * 10) % height);
+}
+
+
+/**
+ * \brief Kernel for the voxel assisted ray marching
+ * \param id 
+ */
+[numthreads(RM_TG_SIZE_X,RM_TG_SIZE_Y,RM_TG_SIZE_Z)]
+void VoxelAssistedRayMarching(uint3 id : SV_DispatchThreadID)
+{
+
+    uint width, height;
+    Destination.GetDimensions(width, height);
+
+    Destination[id.xy] = Source[id.xy];
+    
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+    float rayDst = 0;
+
+    Ray ray;
+
+    ray = CreateCameraRay(uv);
+
+
+    int marchSteps = 0;
+    int voxelPos = walkDown(0, ray.origin);
+    int TriggeredWalkableClause = 0; //TRI
+
+
+    float minDis = 1000000;
+    bool applyEdgeBoost = false;
+
+
+    while (rayDst < maxDst)
+    {
+        marchSteps++;
+        if (false
+        )
+            if (marchSteps > MaxMarchSteps)
+            {
+                Destination[id.xy] = float4(0, 0, 1, 1);
+                return;
+            }
+
+        if (!isInVoxel(ray.origin, VoxelSDFBuffer[0].pos,MapSize))
+        {
+            Destination[id.xy] = DataDisplayer(id, int(rayDst / 64), float4(0, 0.5, 0.5, 1));
+            return;
+        }
+
+        mask0 = VoxelSDFBuffer[voxelPos].Mask[0];
+        mask1 = VoxelSDFBuffer[voxelPos].Mask[1];
+        mask2 = VoxelSDFBuffer[voxelPos].Mask[2];
+        mask3 = VoxelSDFBuffer[voxelPos].Mask[3];
+
+        float dst = LimSceneInfo(ray.origin, 5000, false);
+        float dis = MapSize / pow(2, VoxelSDFBuffer[voxelPos].mipMapLevel + 1);
+        const float3 dis3 = float3(dis, dis, dis);
+        const Intersect maxWalkable = getAABoxIntersectDistance(ray.origin, ray.direction,
+                                                                VoxelSDFBuffer[voxelPos].pos - dis3,
+                                                                VoxelSDFBuffer[voxelPos].pos + dis3);
+
+        if (!applyEdgeBoost && minDis < CloseValue && dst > minDis)
+            applyEdgeBoost = true;
+        minDis = min(minDis, dst);
+
+
+        if (!maxWalkable.is)
+        {
+            Destination[id.xy] = DataDisplayer(id, TriggeredWalkableClause, float4(0, 1, 0, 1));
+            return;
+        }
+
+        if (dst > maxWalkable.dis)
+        {
+            dst = maxWalkable.dis;
+            TriggeredWalkableClause++;
+            voxelPos = walkUp(voxelPos, ray.origin + ray.direction * dst);
+            if (voxelPos == -1)
+            {
+                break;
+                if (DisplayErrorCols)
+                    break;
+                Destination[id.xy] = float4(0, 1, 0, 1);
+                return;
+            }
+            voxelPos = walkDown(voxelPos, ray.origin + ray.direction * dst);
+            if (voxelPos == -1)
+            {
+                if (DisplayErrorCols)
+                    Destination[id.xy] = float4(0.20, 1, 0.2, 1);
+                return;
+            }
+        }
+        else if (marchSteps - TriggeredWalkableClause > MaxMarchSteps || dst <= epsilon)
+
+        {
+            if (voxelPos == -1)
+            {
+                Destination[id.xy] = DataDisplayer(id, voxelPos, float4(0, 0, 0.1, 1));
+
+                return;
+            }
+            voxelPos = walkDown(voxelPos, ray.origin);
+            mask0 = VoxelSDFBuffer[voxelPos].Mask[0];
+            mask1 = VoxelSDFBuffer[voxelPos].Mask[1];
+            mask2 = VoxelSDFBuffer[voxelPos].Mask[2];
+            mask3 = VoxelSDFBuffer[voxelPos].Mask[3];
+            int j = 0;
+            for (int i = 0; i < numShapes; i++)
+            {
+                if (GetBit(i)) j++;
+            }
+            if (DebugMode)
+            {
+                Destination[id.xy] = DataDisplayer(id, voxelPos, float4(j / float(numShapes), 0, 0, 1));
+                Destination[id.xy] = DataDisplayer(id, TriggeredWalkableClause, float4(j / float(numShapes), 0, 0, 1));
+                return;
+            }
+
+            float4 sceneInfo = LimSceneInfoCol(ray.origin);
+            float3 pointOnSurface = ray.origin + ray.direction * dst;
+            float3 normal = LimEstimateNormal(pointOnSurface - ray.direction * epsilon);
+
+            float3 lightDir = (positionLight) ? normalize(_Light - ray.origin) : -_Light;
+            float lighting = saturate(saturate(dot(normal, lightDir)));
+            float3 col = sceneInfo.xyz;
+
+            // Shadow
+            float3 offsetPos = pointOnSurface + normal * shadowBias;
+            float3 dirToLight = (positionLight) ? normalize(_Light - offsetPos) : -_Light;
+
+            ray.origin = offsetPos;
+            ray.direction = dirToLight;
+
+            float dstToLight = (positionLight) ? distance(offsetPos, _Light) : maxDst;
+            float shadow = CalculateShadow(ray, dstToLight);
+            shadow = 1;
+
+            float4 ColOut = float4(col * max((lighting * shadow), 0.5), 1);
+            float BoostValue = 10;
+
+
+            Destination[id.xy] = float4(col * max((lighting * shadow), 0.5), 1);
+            break;
+        }
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+    if (applyEdgeBoost)
+        Destination[id.xy] = Destination[id.xy] * EdgeBoost;
+}
